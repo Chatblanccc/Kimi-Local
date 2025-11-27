@@ -382,6 +382,8 @@ async def chat_proxy(request: dict):
     enable_image_gen = request.get("enable_image_generation", False)
     image_prompt = request.get("image_prompt", "")
     
+    print(f"[DEBUG] Chat request - model: {model}, messages count: {len(messages)}")
+    
     # Gemini 图像生成模型 (使用 GPT_API_KEY，同一个代理)
     if model.startswith("gemini"):
         if not GPT_API_KEY:
@@ -415,26 +417,32 @@ async def chat_proxy(request: dict):
         payload["temperature"] = 0.3
     
     async def event_generator():
-        async with httpx.AsyncClient() as client:
-            async with client.stream(
-                "POST", 
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json"
-                },
-                json=payload,
-                timeout=60.0
-            ) as response:
-                if response.status_code != 200:
-                    error_text = await response.aread()
-                    print(f"API Error ({model}): {response.status_code} - {error_text}")
-                    yield f"data: Error: {response.status_code}\n\n"
-                    return
-                    
-                async for line in response.aiter_lines():
-                    if line:
-                        yield f"{line}\n"
+        try:
+            async with httpx.AsyncClient() as client:
+                async with client.stream(
+                    "POST", 
+                    f"{base_url}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json"
+                    },
+                    json=payload,
+                    timeout=60.0
+                ) as response:
+                    if response.status_code != 200:
+                        error_text = await response.aread()
+                        print(f"API Error ({model}): {response.status_code} - {error_text}")
+                        yield f"data: Error: {response.status_code}\n\n"
+                        return
+                        
+                    async for line in response.aiter_lines():
+                        if line:
+                            yield f"{line}\n"
+        except Exception as e:
+            import traceback
+            print(f"[ERROR] Stream exception: {e}")
+            traceback.print_exc()
+            yield f"data: Error: {str(e)}\n\n"
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
