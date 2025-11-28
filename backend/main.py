@@ -40,8 +40,11 @@ GPT_API_KEY = os.getenv("GPT_API_KEY")
 GPT_BASE_URL = "https://api.gptsapi.net/v1"
 
 # Gemini API 配置 (通过 api.gptsapi.net 代理)
-# 使用 GPT_API_KEY，因为是同一个代理
-GEMINI_BASE_URL = "https://api.gptsapi.net/api/v3"
+GEMINI_PROXY_BASE_URL = "https://api.gptsapi.net/api/v3"
+
+# Google 官方 Gemini API 配置
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
 if not MOONSHOT_API_KEY:
     print("Warning: MOONSHOT_API_KEY not found in environment variables.")
@@ -49,10 +52,35 @@ if not MOONSHOT_API_KEY:
 if not GPT_API_KEY:
     print("Warning: GPT_API_KEY not found in environment variables.")
 
+if not GOOGLE_API_KEY:
+    print("Warning: GOOGLE_API_KEY not found. Gemini image generation will use proxy API.")
+else:
+    print("✓ GOOGLE_API_KEY found. Using official Google Gemini API for image generation.")
+
 
 @app.get("/api/health")
 async def health_check():
     return {"status": "ok"}
+
+@app.get("/api/google-models")
+async def list_google_models():
+    """列出 Google API Key 支持的所有模型"""
+    if not GOOGLE_API_KEY:
+        return {"error": "GOOGLE_API_KEY not configured"}
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{GOOGLE_GEMINI_BASE_URL}/models?key={GOOGLE_API_KEY}",
+            timeout=30.0
+        )
+        if response.status_code == 200:
+            data = response.json()
+            models = data.get("models", [])
+            # 只返回模型名称
+            model_names = [m.get("name", "").replace("models/", "") for m in models]
+            return {"models": model_names}
+        else:
+            return {"error": response.text}
 
 @app.get("/api/models")
 async def get_available_models():
@@ -77,9 +105,12 @@ async def get_available_models():
             {"id": "gpt-3.5-turbo", "name": "GPT-3.5 Turbo", "provider": "openai"},
         ])
     
-    # Gemini 模型 (使用同一个代理，所以检查 GPT_API_KEY)
+    # Google Gemini 模型 (通过代理 API)
     if GPT_API_KEY:
         models.extend([
+            {"id": "gemini-3-pro-preview", "name": "Gemini 3 Pro", "provider": "google"},
+            {"id": "gemini-2.5-pro-preview-05-06", "name": "Gemini 2.5 Pro", "provider": "google"},
+            {"id": "gemini-2.5-flash-preview-05-20", "name": "Gemini 2.5 Flash", "provider": "google"},
             {"id": "gemini-3-pro-image-preview", "name": "Gemini 3 Pro Image", "provider": "gemini"},
         ])
     
@@ -149,7 +180,7 @@ async def upload_and_parse(
     """
     上传文件并解析内容
     - 对于 Kimi 模型：使用 Moonshot API 上传并提取文本
-    - 对于 GPT 模型：返回 base64 编码的图片数据（用于多模态）
+    - 对于 GPT/DALL-E/Gemini 模型：返回 base64 编码的图片数据（用于多模态/图像编辑）
     """
     try:
         content = await file.read()
@@ -163,9 +194,9 @@ async def upload_and_parse(
         # 调试日志
         print(f"[DEBUG] model={model}, is_image={is_image}, file_ext={file_ext}, content_type={content_type}")
         
-        # 如果是 GPT 模型且是图片，返回 base64 数据用于 Vision API
-        if model.startswith("gpt") and is_image:
-            print(f"Processing image for GPT model: {original_filename}")
+        # 对于 GPT/DALL-E/Gemini 模型且是图片，返回 base64 数据
+        if (model.startswith("gpt") or model.startswith("dall-e") or model.startswith("gemini")) and is_image:
+            print(f"Processing image for model {model}: {original_filename}")
             
             # 将图片转为 base64
             base64_data = base64.b64encode(content).decode("utf-8")
@@ -182,13 +213,21 @@ async def upload_and_parse(
                 }
                 mime_type = ext_mime_map.get(file_ext, "image/png")
             
+            # 确定 provider
+            if model.startswith("dall-e"):
+                provider = "dalle"
+            elif model.startswith("gemini"):
+                provider = "gemini"
+            else:
+                provider = "gpt"
+            
             return {
-                "file_id": f"gpt-{uuid.uuid4().hex}",
+                "file_id": f"{provider}-{uuid.uuid4().hex}",
                 "filename": original_filename,
-                "content": "",  # GPT 图片不需要提取文本
+                "content": "",  # 图像模型不需要提取文本
                 "image_base64": base64_data,
                 "mime_type": mime_type,
-                "provider": "gpt"
+                "provider": provider
             }
         
         # 对于 Kimi 模型或非图片文件，使用 Moonshot API
@@ -293,10 +332,162 @@ async def upload_and_parse(
         print(f"Error in upload_and_parse: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+async def gemini_proxy_chat(messages: list, model: str):
+    """
+    使用代理 API (api.gptsapi.net) 调用 Gemini 模型
+    使用 OpenAI 兼容格式
+    """
+    print(f"[Gemini Proxy] Using proxy API with model: {model}")
+    
+    # 流式响应生成器
+    async def event_generator():
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{GPT_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GPT_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "stream": True,
+                        "temperature": 0.7,
+                    },
+                    timeout=120.0
+                )
+                
+                if response.status_code != 200:
+                    error_text = response.text
+                    print(f"[Gemini Proxy] Error {response.status_code}: {error_text[:200]}")
+                    yield f"data: {{\"error\": \"{error_text[:100]}\"}}\n\n"
+                    return
+                
+                # 直接转发 SSE 响应
+                for line in response.text.split("\n"):
+                    if line.strip():
+                        yield f"{line}\n\n"
+                        
+        except Exception as e:
+            print(f"[Gemini Proxy] Exception: {str(e)}")
+            yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+        }
+    )
+
+async def google_gemini_chat(messages: list, model: str):
+    """
+    使用 Google 官方 Gemini API 进行文本对话
+    根据官方文档: https://ai.google.dev/gemini-api/docs/text-generation
+    """
+    print(f"[Google Gemini] Using official API with model: {model}")
+    
+    # 转换消息格式：OpenAI -> Google Gemini
+    gemini_contents = []
+    for msg in messages:
+        role = "user" if msg.get("role") == "user" else "model"
+        content = msg.get("content", "")
+        
+        parts = []
+        if isinstance(content, str):
+            parts.append({"text": content})
+        elif isinstance(content, list):
+            # 多模态内容
+            for item in content:
+                if item.get("type") == "text":
+                    parts.append({"text": item.get("text", "")})
+                elif item.get("type") == "image_url":
+                    image_url = item.get("image_url", {}).get("url", "")
+                    if image_url.startswith("data:"):
+                        # base64 图片
+                        mime_type = image_url.split(";")[0].split(":")[1]
+                        base64_data = image_url.split(",")[1]
+                        parts.append({
+                            "inlineData": {
+                                "mimeType": mime_type,
+                                "data": base64_data
+                            }
+                        })
+        
+        if parts:
+            gemini_contents.append({"role": role, "parts": parts})
+    
+    # 流式响应生成器
+    async def event_generator():
+        try:
+            async with httpx.AsyncClient() as client:
+                # 使用流式 API
+                response = await client.post(
+                    f"{GOOGLE_GEMINI_BASE_URL}/models/{model}:streamGenerateContent?alt=sse&key={GOOGLE_API_KEY}",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "contents": gemini_contents,
+                        "generationConfig": {
+                            "temperature": 0.7,
+                            "topP": 0.95,
+                            "topK": 40,
+                        }
+                    },
+                    timeout=120.0
+                )
+                
+                if response.status_code != 200:
+                    error_text = response.text
+                    print(f"[Google Gemini] Error {response.status_code}: {error_text[:200]}")
+                    yield f"data: {{\"error\": \"{error_text[:100]}\"}}\n\n"
+                    return
+                
+                # 解析 SSE 响应
+                for line in response.text.split("\n"):
+                    if line.startswith("data: "):
+                        data = line[6:]
+                        if data.strip() == "[DONE]":
+                            yield "data: [DONE]\n\n"
+                            break
+                        try:
+                            json_data = json.loads(data)
+                            # 提取文本内容
+                            candidates = json_data.get("candidates", [])
+                            if candidates:
+                                content = candidates[0].get("content", {})
+                                parts = content.get("parts", [])
+                                for part in parts:
+                                    if "text" in part:
+                                        # 转换为 OpenAI 格式
+                                        openai_chunk = {
+                                            "choices": [{
+                                                "delta": {"content": part["text"]},
+                                                "index": 0
+                                            }]
+                                        }
+                                        yield f"data: {json.dumps(openai_chunk)}\n\n"
+                        except json.JSONDecodeError:
+                            continue
+                
+                yield "data: [DONE]\n\n"
+                
+        except Exception as e:
+            print(f"[Google Gemini] Exception: {e}")
+            import traceback
+            traceback.print_exc()
+            yield f"data: {{\"error\": \"{str(e)}\"}}\n\n"
+    
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @app.post("/api/generate-image")
 async def generate_image(request: dict):
     """
-    使用 DALL-E 生成图片，带重试机制
+    使用 DALL-E 生成或编辑图片，带重试机制
+    - 如果提供 reference_image，则使用图像变体/编辑功能
+    - 否则使用纯文本生成
     """
     if not GPT_API_KEY:
         raise HTTPException(status_code=500, detail="GPT_API_KEY not configured")
@@ -305,6 +496,7 @@ async def generate_image(request: dict):
     model = request.get("model", "dall-e-3")
     size = request.get("size", "1024x1024")  # 支持: 1024x1024, 1024x1792, 1792x1024
     quality = request.get("quality", "standard")  # standard 或 hd
+    reference_image = request.get("reference_image")  # base64 图片数据
     
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt is required")
@@ -318,22 +510,48 @@ async def generate_image(request: dict):
             async with httpx.AsyncClient() as client:
                 print(f"[DALL-E] Attempt {attempt + 1}/{max_retries}: {prompt[:50]}...")
                 
-                response = await client.post(
-                    f"{GPT_BASE_URL}/images/generations",
-                    headers={
-                        "Authorization": f"Bearer {GPT_API_KEY}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": model,
-                        "prompt": prompt,
-                        "n": 1,
-                        "size": size,
-                        "quality": quality,
-                        "response_format": "url"
-                    },
-                    timeout=180.0  # 增加超时时间
-                )
+                # 如果有参考图片，使用图像编辑 API
+                if reference_image:
+                    print(f"[DALL-E] Using image edit mode with reference image")
+                    
+                    # 解码 base64 图片
+                    image_bytes = base64.b64decode(reference_image)
+                    
+                    # 使用 DALL-E 2 的图像编辑 API（DALL-E 3 暂不支持编辑）
+                    response = await client.post(
+                        f"{GPT_BASE_URL}/images/edits",
+                        headers={
+                            "Authorization": f"Bearer {GPT_API_KEY}",
+                        },
+                        files={
+                            "image": ("image.png", image_bytes, "image/png"),
+                        },
+                        data={
+                            "prompt": prompt,
+                            "n": 1,
+                            "size": "1024x1024",  # 编辑 API 只支持 1024x1024
+                            "response_format": "url"
+                        },
+                        timeout=180.0
+                    )
+                else:
+                    # 纯文本生成
+                    response = await client.post(
+                        f"{GPT_BASE_URL}/images/generations",
+                        headers={
+                            "Authorization": f"Bearer {GPT_API_KEY}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": model,
+                            "prompt": prompt,
+                            "n": 1,
+                            "size": size,
+                            "quality": quality,
+                            "response_format": "url"
+                        },
+                        timeout=180.0
+                    )
                 
                 if response.status_code == 200:
                     result = response.json()
@@ -345,7 +563,8 @@ async def generate_image(request: dict):
                         "success": True,
                         "image_url": image_url,
                         "revised_prompt": revised_prompt,
-                        "original_prompt": prompt
+                        "original_prompt": prompt,
+                        "mode": "edit" if reference_image else "generate"
                     }
                 else:
                     error_text = response.text
@@ -384,7 +603,18 @@ async def chat_proxy(request: dict):
     
     print(f"[DEBUG] Chat request - model: {model}, messages count: {len(messages)}")
     
-    # Gemini 图像生成模型 (使用 GPT_API_KEY，同一个代理)
+    # Google Gemini 模型 (通过代理 API)
+    google_gemini_models = [
+        "gemini-3-pro-preview",
+        "gemini-2.5-pro-preview-05-06",
+        "gemini-2.5-flash-preview-05-20",
+    ]
+    if model in google_gemini_models:
+        if not GPT_API_KEY:
+            raise HTTPException(status_code=500, detail="GPT_API_KEY not configured for Gemini proxy")
+        return await gemini_proxy_chat(messages, model)
+    
+    # Gemini 图像生成模型 (使用代理 API)
     if model.startswith("gemini"):
         if not GPT_API_KEY:
             raise HTTPException(status_code=500, detail="GPT_API_KEY not configured")
@@ -559,51 +789,150 @@ async def chat_with_image_generation(messages: list, model: str, api_key: str, b
     return JSONResponse(content=response_data)
 
 
-async def gemini_image_generation(messages: list, model: str, image_prompt: str):
+async def gemini_image_generation(messages: list, model: str, image_prompt: str, reference_image: str = None):
     """
-    Gemini 图像生成 (通过 api.gptsapi.net 代理的异步 API)
+    Gemini 图像生成
+    - 优先使用 Google 官方 API（支持真正的图生图）
+    - 降级到代理 API
     """
-    # 从消息中提取用户最后一条文本
-    if not image_prompt:
+    # 从消息中提取用户最后一条文本和图片
+    if not image_prompt or not reference_image:
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 content = msg.get("content", "")
                 if isinstance(content, str):
-                    image_prompt = content
+                    if not image_prompt:
+                        image_prompt = content
                 elif isinstance(content, list):
                     for part in content:
-                        if part.get("type") == "text":
+                        if part.get("type") == "text" and not image_prompt:
                             image_prompt = part.get("text", "")
-                            break
+                        elif part.get("type") == "image_url" and not reference_image:
+                            image_url_data = part.get("image_url", {}).get("url", "")
+                            if image_url_data.startswith("data:"):
+                                reference_image = image_url_data.split(",", 1)[-1]
                 break
     
     if not image_prompt:
-        return JSONResponse(content={
-            "content": "请提供图片描述",
-            "images": []
-        })
-    
-    if not GPT_API_KEY:
-        return JSONResponse(content={
-            "content": "GPT_API_KEY 未配置",
-            "images": []
-        })
+        return JSONResponse(content={"content": "请提供图片描述", "images": []})
     
     import asyncio
     
     async with httpx.AsyncClient() as client:
         try:
-            print(f"[Gemini] Submitting task: {image_prompt[:50]}...")
+            # ===== 优先使用 Google 官方 API =====
+            if GOOGLE_API_KEY:
+                # Gemini 图像生成模型
+                gemini_model = "gemini-2.0-flash-exp-image-generation"
+                print(f"[Gemini] Using Google Official API with model: {gemini_model}")
+                
+                # 如果有参考图片，增强 prompt 以尽量保持人物特征
+                enhanced_prompt = image_prompt
+                if reference_image:
+                    enhanced_prompt = f"""Based on the reference image provided, {image_prompt}
+
+IMPORTANT: Maintain the EXACT same person's facial features, face shape, eye shape, nose, lips, skin tone, and overall appearance from the reference image. The generated image should look like the SAME PERSON, just in a different style or setting."""
+                
+                parts_with_prompt = []
+                if reference_image:
+                    parts_with_prompt.append({
+                        "inline_data": {
+                            "mime_type": "image/png",
+                            "data": reference_image
+                        }
+                    })
+                parts_with_prompt.append({"text": enhanced_prompt})
+                
+                # 调用 Google 官方 Gemini API (Nano Banana)
+                response = await client.post(
+                    f"{GOOGLE_GEMINI_BASE_URL}/models/{gemini_model}:generateContent?key={GOOGLE_API_KEY}",
+                    headers={"Content-Type": "application/json"},
+                    json={
+                        "contents": [{"parts": parts_with_prompt}],
+                        "generationConfig": {
+                            "responseModalities": ["TEXT", "IMAGE"]
+                        }
+                    },
+                    timeout=120.0
+                )
+                
+                if response.status_code == 200:
+                    result = response.json()
+                    print(f"[Gemini] Official API response received")
+                    
+                    response_data = {"content": "", "images": []}
+                    
+                    # 解析响应
+                    candidates = result.get("candidates", [])
+                    if candidates:
+                        content = candidates[0].get("content", {})
+                        for part in content.get("parts", []):
+                            if "text" in part:
+                                response_data["content"] += part["text"]
+                            elif "inlineData" in part:
+                                # 图片数据
+                                inline_data = part["inlineData"]
+                                mime_type = inline_data.get("mimeType", "image/png")
+                                image_data = inline_data.get("data", "")
+                                if image_data:
+                                    response_data["images"].append({
+                                        "url": f"data:{mime_type};base64,{image_data}",
+                                        "type": "base64"
+                                    })
+                    
+                    if response_data["images"]:
+                        if not response_data["content"]:
+                            response_data["content"] = "✨ 图片已生成！"
+                        print(f"[Gemini] Success! Generated {len(response_data['images'])} image(s)")
+                        return JSONResponse(content=response_data)
+                    else:
+                        print(f"[Gemini] No images in response, trying proxy API...")
+                else:
+                    print(f"[Gemini] Official API failed: {response.status_code} - {response.text[:200]}")
             
-            # 步骤1: 提交图像生成任务
+            # ===== 降级到代理 API =====
+            if not GPT_API_KEY:
+                return JSONResponse(content={"content": "API Key 未配置", "images": []})
+            
+            print(f"[Gemini] Falling back to proxy API...")
+            
+            # 如果有参考图片但官方 API 失败，使用分析+生成的方式
+            final_prompt = image_prompt
+            if reference_image:
+                print(f"[Gemini] Analyzing reference image with vision model...")
+                vision_response = await client.post(
+                    f"{GPT_BASE_URL}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {GPT_API_KEY}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": "gpt-4o",
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": f"Analyze this image and create a detailed prompt for regenerating it with this modification: {image_prompt}\n\nOutput only the English prompt."},
+                                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{reference_image}"}}
+                            ]
+                        }],
+                        "max_tokens": 800
+                    },
+                    timeout=60.0
+                )
+                if vision_response.status_code == 200:
+                    final_prompt = vision_response.json()["choices"][0]["message"]["content"]
+                    print(f"[Gemini] Analyzed prompt: {final_prompt[:100]}...")
+            
+            # 提交到代理 API
+            print(f"[Gemini] Submitting to proxy API: {final_prompt[:50]}...")
             submit_response = await client.post(
-                f"{GEMINI_BASE_URL}/google/{model}/text-to-image",
+                f"{GEMINI_PROXY_BASE_URL}/google/{model}/text-to-image",
                 headers={
                     "Authorization": f"Bearer {GPT_API_KEY}",
                     "Content-Type": "application/json"
                 },
                 json={
-                    "prompt": image_prompt,
+                    "prompt": final_prompt,
                     "aspect_ratio": "1:1",
                     "output_format": "png"
                 },
@@ -611,116 +940,62 @@ async def gemini_image_generation(messages: list, model: str, image_prompt: str)
             )
             
             if submit_response.status_code != 200:
-                error_text = submit_response.text
-                print(f"[Gemini] Submit error {submit_response.status_code}: {error_text}")
                 return JSONResponse(content={
-                    "content": f"图片生成任务提交失败：{error_text}",
+                    "content": f"图片生成失败：{submit_response.text}",
                     "images": []
                 })
             
             submit_result = submit_response.json()
-            print(f"[Gemini] Submit response: {json.dumps(submit_result, ensure_ascii=False)}")
-            
-            # 获取 result_id
             result_id = submit_result.get("data", {}).get("id")
             if not result_id:
-                return JSONResponse(content={
-                    "content": "图片生成任务提交失败：未获取到任务ID",
-                    "images": []
-                })
+                return JSONResponse(content={"content": "未获取到任务ID", "images": []})
             
-            print(f"[Gemini] Task submitted, result_id: {result_id}")
+            print(f"[Gemini] Task submitted, polling result_id: {result_id}")
             
-            # 步骤2: 轮询查询结果
-            max_polls = 60  # 最多轮询60次
-            poll_interval = 3  # 每3秒查询一次
-            
-            for poll in range(max_polls):
-                await asyncio.sleep(poll_interval)
-                
-                print(f"[Gemini] Polling result ({poll + 1}/{max_polls})...")
-                
+            # 轮询结果
+            for poll in range(60):
+                await asyncio.sleep(3)
                 result_response = await client.get(
-                    f"{GEMINI_BASE_URL}/predictions/{result_id}/result",
-                    headers={
-                        "Authorization": f"Bearer {GPT_API_KEY}"
-                    },
+                    f"{GEMINI_PROXY_BASE_URL}/predictions/{result_id}/result",
+                    headers={"Authorization": f"Bearer {GPT_API_KEY}"},
                     timeout=30.0
                 )
                 
                 if result_response.status_code != 200:
-                    print(f"[Gemini] Poll error {result_response.status_code}: {result_response.text}")
                     continue
                 
                 result_data = result_response.json()
-                print(f"[Gemini] Poll response: {json.dumps(result_data, ensure_ascii=False)[:500]}...")
-                
                 status = result_data.get("data", {}).get("status", "")
                 
-                if status == "completed" or status == "succeeded":
-                    # 获取生成的图片
+                if status in ["completed", "succeeded"]:
                     outputs = result_data.get("data", {}).get("outputs", [])
-                    
-                    response_data = {
-                        "content": "✨ 图片已生成！",
-                        "images": []
-                    }
+                    response_data = {"content": "✨ 图片已生成！", "images": []}
                     
                     for output in outputs:
                         if isinstance(output, str):
-                            # 可能是 URL 或 base64
-                            if output.startswith("http"):
-                                response_data["images"].append({
-                                    "url": output,
-                                    "type": "url"
-                                })
-                            elif output.startswith("data:"):
-                                response_data["images"].append({
-                                    "url": output,
-                                    "type": "base64"
-                                })
+                            img_type = "url" if output.startswith("http") else "base64"
+                            response_data["images"].append({"url": output, "type": img_type})
                         elif isinstance(output, dict):
                             url = output.get("url") or output.get("image")
                             if url:
-                                response_data["images"].append({
-                                    "url": url,
-                                    "type": "url" if url.startswith("http") else "base64"
-                                })
-                    
-                    if response_data["images"]:
-                        print(f"[Gemini] Success! Generated {len(response_data['images'])} image(s)")
-                    else:
-                        response_data["content"] = "图片生成完成，但未能获取图片数据"
+                                img_type = "url" if url.startswith("http") else "base64"
+                                response_data["images"].append({"url": url, "type": img_type})
                     
                     return JSONResponse(content=response_data)
                 
-                elif status == "failed" or status == "error":
-                    error_msg = result_data.get("data", {}).get("error", "未知错误")
+                elif status in ["failed", "error"]:
                     return JSONResponse(content={
-                        "content": f"图片生成失败：{error_msg}",
+                        "content": f"图片生成失败：{result_data.get('data', {}).get('error', '未知错误')}",
                         "images": []
                     })
-                
-                # 其他状态继续轮询 (processing, pending 等)
             
-            # 超时
-            return JSONResponse(content={
-                "content": "图片生成超时，请稍后重试",
-                "images": []
-            })
+            return JSONResponse(content={"content": "图片生成超时", "images": []})
                 
-        except httpx.TimeoutException:
-            print(f"[Gemini] Timeout")
-            return JSONResponse(content={
-                "content": "图片生成超时，请稍后重试",
-                "images": []
-            })
         except Exception as e:
             print(f"[Gemini] Exception: {e}")
-            return JSONResponse(content={
-                "content": f"图片生成出错：{str(e)}",
-                "images": []
-            })
+            import traceback
+            traceback.print_exc()
+            return JSONResponse(content={"content": f"图片生成出错：{str(e)}", "images": []})
 
 
 # Static files (Frontend)

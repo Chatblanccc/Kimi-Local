@@ -18,9 +18,13 @@ const AVAILABLE_MODELS = [
   // GPT 模型
   { id: 'gpt-5.1', name: 'GPT-5.1', description: '最新旗舰模型', provider: 'gpt' },
   { id: 'gpt-4o', name: 'GPT-4o', description: '多模态高效', provider: 'gpt' },
+  // Google Gemini 模型 (通过代理 API)
+  { id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', description: 'Google 最强模型', provider: 'google' },
+  { id: 'gemini-2.5-pro-preview-05-06', name: 'Gemini 2.5 Pro', description: 'Google 旗舰模型', provider: 'google' },
+  { id: 'gemini-2.5-flash-preview-05-20', name: 'Gemini 2.5 Flash', description: 'Google 快速模型', provider: 'google' },
   // 图像生成模型
   { id: 'dall-e-3', name: 'DALL-E 3', description: 'OpenAI 图像生成', provider: 'dalle' },
-  { id: 'gemini-3-pro-image-preview', name: 'Gemini 3 Pro', description: 'Google 图像生成', provider: 'gemini' },
+  { id: 'gemini-3-pro-image-preview', name: 'Gemini 3 Pro Image', description: 'Google 图像生成', provider: 'gemini' },
 ] as const
 
 type ModelId = typeof AVAILABLE_MODELS[number]['id']
@@ -505,10 +509,13 @@ function App() {
     if ((!inputValue.trim() && !currentFile) || isLoading) return
 
     let userMessageContent = inputValue
+    // 保存当前文件引用，因为稍后会清空 currentFile
+    const uploadedFile = currentFile
+    
     const newMessage: Message = {
       role: 'user',
       content: userMessageContent,
-      files: currentFile ? [currentFile] : undefined
+      files: uploadedFile ? [uploadedFile] : undefined
     }
     
     const newMessages = [...messages, newMessage]
@@ -521,21 +528,29 @@ function App() {
       // 检查是否是 DALL-E 图像生成模型
       if (selectedModel === 'dall-e-3') {
         // 先显示带加载动画的消息
+        const hasRefImage = uploadedFile?.image_base64
         setMessages(prev => [...prev, { 
           role: 'assistant', 
-          content: '🎨 正在生成图片，请稍候...',
+          content: hasRefImage ? '🎨 正在根据参考图片生成...' : '🎨 正在生成图片，请稍候...',
           isGeneratingImage: true 
         }])
+        
+        const requestBody: any = {
+          prompt: userMessageContent,
+          model: 'dall-e-3',
+          size: '1024x1024',
+          quality: 'standard'
+        }
+        
+        // 如果有上传的参考图片，添加到请求中
+        if (uploadedFile?.image_base64) {
+          requestBody.reference_image = uploadedFile.image_base64
+        }
         
         const response = await fetch('/api/generate-image', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            prompt: userMessageContent,
-            model: 'dall-e-3',
-            size: '1024x1024',
-            quality: 'standard'
-          }),
+          body: JSON.stringify(requestBody),
         })
 
         if (!response.ok) {
@@ -566,20 +581,35 @@ function App() {
         return
       }
       
-      // 检查是否是 Gemini 图像生成模型
-      if (selectedModel.startsWith('gemini')) {
+      // 检查是否是 Gemini 图像生成模型（只有 gemini-3-pro-image-preview）
+      if (selectedModel === 'gemini-3-pro-image-preview') {
         // 先显示带加载动画的消息
+        const hasRefImage = uploadedFile?.image_base64
         setMessages(prev => [...prev, { 
           role: 'assistant', 
-          content: '🎨 Gemini 正在生成图片...',
+          content: hasRefImage ? '🎨 Gemini 正在根据参考图片生成...' : '🎨 Gemini 正在生成图片...',
           isGeneratingImage: true 
         }])
+        
+        // 构建消息内容，如果有参考图片则使用多模态格式
+        let messageContent: any = userMessageContent
+        if (uploadedFile?.image_base64) {
+          messageContent = [
+            { type: 'text', text: userMessageContent },
+            { 
+              type: 'image_url', 
+              image_url: { 
+                url: `data:${uploadedFile.mime_type || 'image/png'};base64,${uploadedFile.image_base64}` 
+              } 
+            }
+          ]
+        }
         
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            messages: [{ role: 'user', content: userMessageContent }],
+            messages: [{ role: 'user', content: messageContent }],
             model: selectedModel,
           }),
         })
@@ -618,11 +648,13 @@ function App() {
 
       // 根据模型类型构建不同格式的消息
       const isGptModel = selectedModel.startsWith('gpt')
-      const wantsImage = isGptModel && shouldAutoGenerateImage(userMessageContent)
+      const isGoogleGeminiModel = selectedModel === 'gemini-3-pro-preview' || selectedModel.startsWith('gemini-2.5')
+      const isMultimodalModel = isGptModel || isGoogleGeminiModel
+      const wantsImage = isMultimodalModel && shouldAutoGenerateImage(userMessageContent)
       
       const formattedMessages = newMessages.map(m => {
-        // 如果是 GPT 模型且有图片，使用多模态格式
-        if (isGptModel && m.files && m.files.some(f => f.image_base64)) {
+        // 如果是多模态模型且有图片，使用多模态格式
+        if (isMultimodalModel && m.files && m.files.some(f => f.image_base64)) {
           const contentParts: any[] = []
           
           // 添加文本内容
@@ -657,7 +689,7 @@ function App() {
         return { role: m.role, content: content }
       })
       
-      // 如果是 GPT 模型且启用了图像生成，使用非流式请求
+      // 如果是多模态模型且检测到生图意图，调用图像生成
       if (wantsImage) {
         // 先显示带加载动画的消息
         setMessages(prev => [...prev, { 
@@ -666,12 +698,15 @@ function App() {
           isGeneratingImage: true 
         }])
         
+        // Gemini 模型使用 Gemini 3 Pro Image，GPT 模型使用 DALL-E
+        const imageModel = isGoogleGeminiModel ? 'gemini-3-pro-image-preview' : selectedModel
+        
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             messages: formattedMessages,
-            model: selectedModel,
+            model: imageModel,
             enable_image_generation: true,
             image_prompt: userMessageContent
           }),
@@ -943,6 +978,35 @@ function App() {
                   {/* 分隔线 */}
                   <div className="my-1 border-t border-gray-100" />
                   
+                  {/* Google Gemini 模型组 */}
+                  <div className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase tracking-wider">Google</div>
+                  {AVAILABLE_MODELS.filter(m => m.provider === 'google').map((model) => (
+                    <button
+                      key={model.id}
+                      onClick={() => {
+                        setSelectedModel(model.id)
+                        setIsModelMenuOpen(false)
+                      }}
+                      className={cn(
+                        "w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-left transition-colors",
+                        selectedModel === model.id 
+                          ? "bg-blue-50 text-blue-700" 
+                          : "hover:bg-gray-50 text-gray-700"
+                      )}
+                    >
+                      <div className="flex-1">
+                        <div className="font-medium text-sm">{model.name}</div>
+                        <div className="text-xs text-gray-400">{model.description}</div>
+                      </div>
+                      {selectedModel === model.id && (
+                        <Check className="w-4 h-4 text-blue-600" />
+                      )}
+                    </button>
+                  ))}
+                  
+                  {/* 分隔线 */}
+                  <div className="my-1 border-t border-gray-100" />
+                  
                   {/* 图像生成模型组 */}
                   <div className="px-3 py-1.5 text-xs font-semibold text-gray-400 uppercase tracking-wider">🎨 图像生成</div>
                   {AVAILABLE_MODELS.filter(m => m.provider === 'dalle' || m.provider === 'gemini').map((model) => (
@@ -1124,7 +1188,7 @@ function App() {
               onChange={(e) => setInputValue(e.target.value)}
               placeholder={
                 isUploading ? "正在解析文件..." : 
-                selectedModel === 'dall-e-3' || selectedModel.startsWith('gemini') ? "描述你想生成的图片..." : 
+                selectedModel === 'dall-e-3' || selectedModel === 'gemini-3-pro-image-preview' ? "描述你想生成的图片..." : 
                 "发送消息..."
               }
               disabled={isUploading || isLoading}
