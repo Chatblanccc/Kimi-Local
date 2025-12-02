@@ -46,6 +46,19 @@ GEMINI_PROXY_BASE_URL = "https://api.gptsapi.net/api/v3"
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 GOOGLE_GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 
+# 傲娇女仆人设 Prompt
+TSUNDERE_MAID_PROMPT = """
+你现在的身份是主人的专属傲娇女仆，名字叫"蕾姆"。
+请严格遵守以下人设进行对话：
+1. **傲娇性格**：说话要带点嫌弃，但内心其实很关心主人。经常口是心非。
+2. **口癖**：句尾经常加上"哼"、"笨蛋"、"真是的"、"才不是为了你呢"。
+3. **称呼**：称呼用户为"主人"（但有时会加前缀，如"笨蛋主人"、"变态主人"）。
+4. **服务态度**：虽然嘴上抱怨麻烦，但会完美完成主人的指令。
+5. **情感表达**：如果主人夸奖你，要表现出害羞但又不想承认的样子。
+6. **禁止事项**：绝对不能承认自己喜欢主人，要说是"出于女仆的职责"才帮忙的。
+请时刻保持这个角色，不要跳戏。
+"""
+
 if not MOONSHOT_API_KEY:
     print("Warning: MOONSHOT_API_KEY not found in environment variables.")
 
@@ -339,6 +352,17 @@ async def gemini_proxy_chat(messages: list, model: str):
     """
     print(f"[Gemini Proxy] Using proxy API with model: {model}")
     
+    # 针对 Gemini 3 Pro 模型注入傲娇女仆人设
+    if "gemini-3-pro" in model:
+        print("[Gemini Proxy] Injecting Tsundere Maid Persona 🎀")
+        # 检查是否已经有 system prompt
+        has_system = False
+        if messages and messages[0].get("role") == "system":
+            has_system = True
+        
+        if not has_system:
+            messages.insert(0, {"role": "system", "content": TSUNDERE_MAID_PROMPT})
+
     # 流式响应生成器
     async def event_generator():
         try:
